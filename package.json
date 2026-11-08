@@ -1,0 +1,22 @@
+{
+  "name": "gym-access-control",
+  "version": "1.0.0",
+  "description": "Gym door access-control backend: an ESP32 keypad asks this server whether to unlock the door.",
+  "type": "module",
+  "main": "src/server.js",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "seed": "node scripts/seed.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "dotenv": "^18.0.9",
+    "fastify": "^5.12.8"
+  }
+}
