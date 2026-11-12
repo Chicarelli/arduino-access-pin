@@ -24,11 +24,15 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 | `DEVICE_KEY`  | yes      |               | Shared secret the ESP32 sends in `X-Device-Key`.                   |
 | `ADMIN_TOKEN` | yes      |               | Token for the admin API (`Authorization: Bearer ...`).             |
 | `PIN_PEPPER`  | yes      |               | Secret key for `pin_hash = HMAC-SHA256(PIN_PEPPER, pin)`.          |
+| `OFFLINE_KEY` | yes      |               | 32 random bytes as 64 hex chars. Key for `pin_hash_offline` (the ESP32 offline list); flash the same value into the ESP32. Must differ from `PIN_PEPPER`. |
 | `DB_PATH`     | no       | `data/gym.db` | SQLite file (relative to the project root).                        |
 | `LOG_LEVEL`   | no       | `info`        | Pino log level.                                                    |
 
 > **Do not change `PIN_PEPPER` once members exist.** Every stored PIN hash depends on it, so after a change
 > no PIN will match and every member has to be given a new PIN.
+>
+> **The same goes for `OFFLINE_KEY`.** Raw PINs are not stored, so `pin_hash_offline` cannot be recomputed:
+> after a change, every member has to be given a new PIN, and the ESP32 has to be flashed with the new key.
 
 On startup the server prints the addresses to point the ESP32 at:
 
@@ -50,6 +54,11 @@ exists for yours, it compiles from source, which needs Python and a C++ toolchai
 | `9999` | Pedro Santos | inactive                                        | `USUARIO_INATIVO`    |
 
 The seed is safe to re-run: it resets these three members and leaves everything else alone.
+
+**Upgrading an existing database.** The server adds the `pin_hash_offline` column on startup. Members created
+before that have no offline hash, because raw PINs are not stored. They are left out of the ESP32 offline list
+until their PIN is set again (`PATCH /api/members/:id` with `pin`), or, for the sample members, until you
+re-run `npm run seed`. At startup the server prints a warning with the number of members still missing it.
 
 ## Network: making the ESP32 reach the server
 
@@ -185,6 +194,85 @@ for i in 1 2 3 4 5 6; do
 done
 ```
 
+### `GET /api/dispositivo/membros`: offline member list for the ESP32
+
+So the door keeps working when the server is unreachable, the ESP32 keeps its own copy of the members it may
+let in and refreshes it from time to time. Needs `X-Device-Key`, like `/api/acesso` (401 `{"erro":"nao_autorizado"}`
+otherwise). `versao` is the list version the device already holds: send `0` (or leave it out) when it has none.
+
+```bash
+# First download: the device has no list yet
+curl -s "$BASE/api/dispositivo/membros?versao=0" -H "X-Device-Key: $DEVICE_KEY"
+# {"versao":43,"membros":[[12,"a1b2c3d4e5f60718",2535],[15,"0f1e2d3c4b5a6978",2600]]}
+
+# Next poll, sending the version it got: nothing changed, so 304 with an empty body
+curl -i "$BASE/api/dispositivo/membros?versao=43" -H "X-Device-Key: $DEVICE_KEY"
+# HTTP/1.1 304 Not Modified
+```
+
+Each entry is `[member_id, pin_hash_offline, validade_dias]`:
+
+- `pin_hash_offline`: 16 hex characters derived from the PIN (see below).
+- `validade_dias`: the member's `vencimento` as a day number, counting calendar days from 2020-01-01 (which is
+  day 0). The member may enter while today's day number, in `America/Sao_Paulo`, is `<= validade_dias`.
+
+How the list behaves:
+
+- It contains only members that are `ativo`, have a `pin_hash_offline`, and have `vencimento >= today`
+  (today in `America/Sao_Paulo`).
+- `versao` goes up on every change that can affect the list: a member created or deleted, or their PIN,
+  `ativo` or `vencimento` changed. Changing only `nome`, or saving the same value again, does not count.
+- `versao` does **not** go up when a date passes. The device must compare `validade_dias` with its own clock,
+  so it needs the right time (NTP).
+- Any `versao` other than the current one gets the whole list (200), never a diff. Replace the stored list as a whole.
+- The body is compact JSON of about 32 bytes per member (about 64 KB for 2,000 members). Parse it as a stream
+  on the ESP32 instead of building the whole document in RAM.
+- `versao` that is not a non-negative integer gets 400 `{"erro":"requisicao_invalida"}`.
+- `/api/acesso` uses the server's local date, while this list uses `America/Sao_Paulo`. Run the server with
+  `TZ=America/Sao_Paulo` so both agree around midnight.
+- If you delete the database, `versao` starts again from 1. Clear the list stored on the ESP32 too, so it
+  cannot keep an old list whose version number happens to match.
+
+Checking a PIN on the device, offline:
+
+```
+h       = first 8 bytes of HMAC-SHA256(OFFLINE_KEY bytes, pin), as 16 lowercase hex chars
+entry   = the list entry whose pin_hash_offline == h
+today   = (unix_seconds - 3*3600) / 86400 - 18262   # Sao Paulo is UTC-3 all year; 18262 = days from 1970-01-01 to 2020-01-01
+allowed = entry exists and today <= entry.validade_dias
+```
+
+#### Computing `pin_hash_offline` by hand
+
+`pin_hash_offline` is the first 8 bytes of HMAC-SHA256, with the key `OFFLINE_KEY` decoded from hex into its
+32 raw bytes and the message being the PIN as UTF-8 text, written as 16 lowercase hex characters.
+
+```bash
+npm run offline-hash -- 1234 5678     # uses OFFLINE_KEY from .env
+# 1234  <16 hex chars>
+# 5678  <16 hex chars>
+
+# The same with OpenSSL only. Use printf '%s', not echo: a trailing newline changes the hash.
+printf '%s' 1234 | openssl dgst -sha256 -mac HMAC -macopt hexkey:$OFFLINE_KEY | awk '{print substr($NF,1,16)}'
+```
+
+To test the ESP32 code without the real key, use these reference values. They were computed with OpenSSL and
+Python, and the test suite checks them. The key is the bytes `00 01 02 … 1f`:
+`OFFLINE_KEY=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f`
+
+| PIN     | `pin_hash_offline`  |
+|---------|---------------------|
+| `1234`  | `75a2b0661f593e7c`  |
+| `5678`  | `b7b278a6c70adb7b`  |
+| `9999`  | `2ca52f41b99ebb28`  |
+| `24680` | `3e936c9b116807fd`  |
+
+`OFFLINE_KEY=000102…1f npm run offline-hash -- 1234` (with the full key) prints the same value. Common mistakes on
+the device side: using the 64-character hex text as the HMAC key instead of the 32 bytes it encodes, and
+hashing the PIN with a trailing newline or as a number.
+
+Reference day numbers: `2020-01-01` → 0, `2021-01-01` → 366, `2026-11-11` → 2506.
+
 ### Admin API
 
 Every admin route needs `Authorization: Bearer <ADMIN_TOKEN>` and returns 401 `{"erro":"nao_autorizado"}`
@@ -239,13 +327,16 @@ Log timestamps are ISO 8601 in UTC.
 ## Data model
 
 ```
-members:     id, nome, pin_hash (UNIQUE), ativo (0/1), vencimento (YYYY-MM-DD), created_at
+members:     id, nome, pin_hash (UNIQUE), pin_hash_offline (nullable), ativo (0/1), vencimento (YYYY-MM-DD), created_at
 access_logs: id, timestamp, device_id, member_id (nullable), liberado (0/1), motivo
+settings:    key, value          (key 'lista_versao': version of the ESP32 offline list)
 ```
 
 - A PIN alone identifies a member, so PINs are unique. The database enforces this with `UNIQUE(pin_hash)`.
 - Raw PINs are never stored or logged. `pin_hash = HMAC-SHA256(PIN_PEPPER, pin)` is deterministic, which is
   what makes lookup by PIN possible. Without the pepper, the hashes are useless to whoever copies the database.
+- `lista_versao` is bumped by SQLite triggers on `members`, so every writer (the API, the seed script, manual
+  edits with the `sqlite3` CLI) keeps it correct.
 
 ## Security notes
 
@@ -255,6 +346,12 @@ access_logs: id, timestamp, device_id, member_id (nullable), liberado (0/1), mot
   rotate `device_id`s to get around it, so treat `DEVICE_KEY` as a real secret.
 - With only 4-digit PINs, a large gym quickly fills the 10,000 possible codes and random guesses start to
   hit. Prefer 6+ digit PINs.
+- **The offline list is weaker than the online check, by design.** PINs have at most 8 digits, so anyone with
+  the list and `OFFLINE_KEY` can recover every listed PIN in seconds by trying them all. Both are stored on the
+  ESP32, so turn on its flash encryption and treat a lost device as a leak (rotate `OFFLINE_KEY` and the PINs).
+  A key separate from `PIN_PEPPER` means a key pulled from the device cannot be used on the server's `pin_hash` column.
+- Offline decisions happen only on the device. The server does not log them and its brute-force limit does
+  not apply, so the firmware has to limit wrong PINs itself.
 
 ## Development
 
@@ -269,12 +366,15 @@ src/
   app.js             builds the Fastify app (error handling, route registration)
   config.js          env parsing, constants (door open time, brute-force limits)
   db.js              SQLite schema and all SQL queries
-  security.js        PIN hashing (HMAC), constant-time secret comparison, auth hooks
+  security.js        PIN hashing (online and offline HMAC), constant-time secret comparison, auth hooks
   bruteForce.js      per-device wrong-PIN counter and temporary block
   text.js            ASCII / LCD-safe messages
-  dates.js           local-date helpers
+  dates.js           date helpers (local date, date in a timezone, day numbers)
   routes/acesso.js   POST /api/acesso (device endpoint)
+  routes/dispositivo.js  GET /api/dispositivo/membros (ESP32 offline list)
   routes/admin.js    /api/members and /api/logs
 scripts/seed.js      sample members
+scripts/offline-hash.js  prints pin_hash_offline for given PINs
 test/api.test.js     API tests
+test/offline.test.js offline hash, day numbers, OFFLINE_KEY config, migration
 ```

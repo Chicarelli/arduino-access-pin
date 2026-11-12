@@ -12,6 +12,7 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "seed": "node scripts/seed.js",
+    "offline-hash": "node scripts/offline-hash.js",
     "test": "node --test"
   },
   "dependencies": {

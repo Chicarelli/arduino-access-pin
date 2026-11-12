@@ -2,13 +2,14 @@ import Fastify from 'fastify';
 import { BRUTE_FORCE } from './config.js';
 import { createRepository } from './db.js';
 import { createBruteForceGuard } from './bruteForce.js';
-import { createPinHasher } from './security.js';
+import { createOfflinePinHasher, createPinHasher } from './security.js';
 import acessoRoutes from './routes/acesso.js';
 import adminRoutes from './routes/admin.js';
+import dispositivoRoutes from './routes/dispositivo.js';
 
 /**
  * Builds the Fastify app. Takes an already-open database so tests can pass an in-memory one.
- * `now` is injectable so tests can move the brute-force clock.
+ * `now` is injectable so tests can move the clock (brute-force windows, "today" for the offline list).
  */
 export function buildApp({ config, db, logger = false, now = Date.now }) {
   const app = Fastify({
@@ -21,6 +22,7 @@ export function buildApp({ config, db, logger = false, now = Date.now }) {
 
   const repo = createRepository(db);
   const hashPin = createPinHasher(config.pinPepper);
+  const hashPinOffline = createOfflinePinHasher(config.offlineKey);
   const guard = createBruteForceGuard({ ...BRUTE_FORCE, now });
   app.addHook('onClose', async () => guard.stop());
 
@@ -40,7 +42,8 @@ export function buildApp({ config, db, logger = false, now = Date.now }) {
 
   app.get('/api/health', async () => ({ status: 'ok' }));
   app.register(acessoRoutes, { config, repo, hashPin, guard });
-  app.register(adminRoutes, { prefix: '/api', config, repo, hashPin });
+  app.register(dispositivoRoutes, { config, repo, now });
+  app.register(adminRoutes, { prefix: '/api', config, repo, hashPin, hashPinOffline });
 
   return app;
 }

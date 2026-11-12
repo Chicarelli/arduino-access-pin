@@ -2,14 +2,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 
-const SCHEMA = `
+const TABLES = `
 CREATE TABLE IF NOT EXISTS members (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  nome        TEXT    NOT NULL,
-  pin_hash    TEXT    NOT NULL UNIQUE,
-  ativo       INTEGER NOT NULL DEFAULT 1 CHECK (ativo IN (0, 1)),
-  vencimento  TEXT    NOT NULL,            -- YYYY-MM-DD: membership paid until (inclusive)
-  created_at  TEXT    NOT NULL             -- ISO 8601, UTC
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  nome              TEXT    NOT NULL,
+  pin_hash          TEXT    NOT NULL UNIQUE,
+  ativo             INTEGER NOT NULL DEFAULT 1 CHECK (ativo IN (0, 1)),
+  vencimento        TEXT    NOT NULL,      -- YYYY-MM-DD: membership paid until (inclusive)
+  created_at        TEXT    NOT NULL,      -- ISO 8601, UTC
+  pin_hash_offline  TEXT                   -- 16 hex chars for the ESP32 offline list; NULL = not in the list
 );
 
 CREATE TABLE IF NOT EXISTS access_logs (
@@ -22,7 +23,47 @@ CREATE TABLE IF NOT EXISTS access_logs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_access_logs_member_id ON access_logs(member_id);
+
+CREATE TABLE IF NOT EXISTS settings (
+  key    TEXT    PRIMARY KEY,
+  value  INTEGER NOT NULL
+);
+
+-- Starts at 1, so a device that has no list yet (and sends versao=0) always gets a full download.
+INSERT OR IGNORE INTO settings (key, value) VALUES ('lista_versao', 1);
 `;
+
+/**
+ * lista_versao goes up on every change that affects the offline list: member created, deleted, or PIN, ativo
+ * or vencimento changed. Triggers make this hold for every writer (API, seed script, manual edits), in the
+ * same transaction as the change. Updates that leave those columns as they were (nome only, same PIN again)
+ * do not count. The passing of time never changes it: the ESP32 checks dates itself.
+ */
+const BUMP_LISTA_VERSAO = "UPDATE settings SET value = value + 1 WHERE key = 'lista_versao';";
+const TRIGGERS = `
+CREATE TRIGGER IF NOT EXISTS lista_versao_on_insert AFTER INSERT ON members
+BEGIN ${BUMP_LISTA_VERSAO} END;
+
+CREATE TRIGGER IF NOT EXISTS lista_versao_on_delete AFTER DELETE ON members
+BEGIN ${BUMP_LISTA_VERSAO} END;
+
+CREATE TRIGGER IF NOT EXISTS lista_versao_on_update
+AFTER UPDATE OF pin_hash, pin_hash_offline, ativo, vencimento ON members
+WHEN OLD.pin_hash IS NOT NEW.pin_hash
+  OR OLD.pin_hash_offline IS NOT NEW.pin_hash_offline
+  OR OLD.ativo IS NOT NEW.ativo
+  OR OLD.vencimento IS NOT NEW.vencimento
+BEGIN ${BUMP_LISTA_VERSAO} END;
+`;
+
+/** Brings a database created by an older version up to date. Runs inside the schema transaction. */
+function migrate(db) {
+  const columns = db.prepare('PRAGMA table_info(members)').all().map((c) => c.name);
+  if (!columns.includes('pin_hash_offline')) {
+    // Existing members get NULL and stay out of the offline list until their PIN is set again (or re-seeded).
+    db.exec('ALTER TABLE members ADD COLUMN pin_hash_offline TEXT');
+  }
+}
 
 export function openDatabase(file) {
   if (file !== ':memory:') {
@@ -33,7 +74,12 @@ export function openDatabase(file) {
   db.pragma('synchronous = NORMAL');
   db.pragma('foreign_keys = ON');
   db.pragma('busy_timeout = 5000');
-  db.exec(SCHEMA);
+  // IMMEDIATE: if the server and the seed script start together, only one of them migrates.
+  db.transaction(() => {
+    db.exec(TABLES);
+    migrate(db);
+    db.exec(TRIGGERS);
+  }).immediate();
   return db;
 }
 
@@ -77,7 +123,7 @@ export function createRepository(db) {
     listMembers: db.prepare(`SELECT ${MEMBER_COLUMNS} FROM members ORDER BY id`),
     getMember: db.prepare(`SELECT ${MEMBER_COLUMNS} FROM members WHERE id = ?`),
     insertMember: db.prepare(
-      'INSERT INTO members (nome, pin_hash, ativo, vencimento, created_at) VALUES (?, ?, ?, ?, ?)',
+      'INSERT INTO members (nome, pin_hash, pin_hash_offline, ativo, vencimento, created_at) VALUES (?, ?, ?, ?, ?, ?)',
     ),
     deleteMember: db.prepare('DELETE FROM members WHERE id = ?'),
     listLogs: db.prepare(`
@@ -86,7 +132,23 @@ export function createRepository(db) {
       LEFT JOIN members m ON m.id = l.member_id
       ORDER BY l.id DESC
       LIMIT ?`),
+    listaVersao: db.prepare("SELECT value FROM settings WHERE key = 'lista_versao'").pluck(),
+    // vencimento is YYYY-MM-DD, so comparing strings compares dates.
+    listOffline: db.prepare(`
+      SELECT id, pin_hash_offline, vencimento
+      FROM members
+      WHERE ativo = 1 AND pin_hash_offline IS NOT NULL AND vencimento >= ?
+      ORDER BY id`),
+    countMissingOffline: db.prepare('SELECT COUNT(*) FROM members WHERE pin_hash_offline IS NULL').pluck(),
   };
+
+  // One read transaction, so the version and the list always come from the same snapshot, even if another
+  // process (the seed script) writes in between.
+  const readOfflineList = db.transaction((today, knownVersion) => {
+    const versao = stmt.listaVersao.get();
+    if (versao === knownVersion) return { versao, membros: null };
+    return { versao, membros: stmt.listOffline.all(today) };
+  });
 
   return {
     findMemberByPinHash(pinHash) {
@@ -107,18 +169,24 @@ export function createRepository(db) {
     },
 
     /** Throws a SQLITE_CONSTRAINT_UNIQUE error if the PIN is already used. */
-    createMember({ nome, pinHash, ativo, vencimento }) {
+    createMember({ nome, pinHash, pinHashOffline, ativo, vencimento }) {
       const createdAt = new Date().toISOString();
-      const info = stmt.insertMember.run(nome, pinHash, ativo ? 1 : 0, vencimento, createdAt);
+      const info = stmt.insertMember.run(nome, pinHash, pinHashOffline, ativo ? 1 : 0, vencimento, createdAt);
       return this.getMember(Number(info.lastInsertRowid));
     },
 
-    /** Returns the updated member, or null if it does not exist. Throws on duplicate PIN. */
-    updateMember(id, { nome, pinHash, ativo, vencimento }) {
+    /**
+     * Returns the updated member, or null if it does not exist. Throws on duplicate PIN.
+     * pinHash and pinHashOffline come from the same PIN and are always written together.
+     */
+    updateMember(id, { nome, pinHash, pinHashOffline, ativo, vencimento }) {
       const sets = [];
       const values = [];
       if (nome !== undefined) { sets.push('nome = ?'); values.push(nome); }
-      if (pinHash !== undefined) { sets.push('pin_hash = ?'); values.push(pinHash); }
+      if (pinHash !== undefined) {
+        sets.push('pin_hash = ?', 'pin_hash_offline = ?');
+        values.push(pinHash, pinHashOffline);
+      }
       if (ativo !== undefined) { sets.push('ativo = ?'); values.push(ativo ? 1 : 0); }
       if (vencimento !== undefined) { sets.push('vencimento = ?'); values.push(vencimento); }
       if (sets.length > 0) {
@@ -134,6 +202,22 @@ export function createRepository(db) {
 
     listLogs(limit) {
       return stmt.listLogs.all(limit).map(toLog);
+    },
+
+    getListaVersao() {
+      return stmt.listaVersao.get();
+    },
+
+    /**
+     * Members the ESP32 may let in offline: ativo, with an offline hash, and vencimento >= today (YYYY-MM-DD).
+     * If knownVersion is already the current lista_versao, `membros` is null (nothing to send).
+     */
+    getOfflineList(today, knownVersion) {
+      return readOfflineList(today, knownVersion);
+    },
+
+    countMembersWithoutOfflineHash() {
+      return stmt.countMissingOffline.get();
     },
   };
 }

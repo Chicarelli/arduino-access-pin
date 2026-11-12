@@ -1,13 +1,14 @@
-// Creates (or resets) 3 sample members. Safe to run more than once.
+// Creates (or resets) 3 sample members, including their offline PIN hash. Safe to run more than once.
 import 'dotenv/config';
 import { loadConfig } from '../src/config.js';
 import { openDatabase } from '../src/db.js';
 import { addDays, localDateString } from '../src/dates.js';
-import { createPinHasher } from '../src/security.js';
+import { createOfflinePinHasher, createPinHasher } from '../src/security.js';
 
 const config = loadConfig();
 const db = openDatabase(config.dbPath);
 const hashPin = createPinHasher(config.pinPepper);
+const hashPinOffline = createOfflinePinHasher(config.offlineKey);
 const today = new Date();
 
 const samples = [
@@ -17,10 +18,11 @@ const samples = [
 ];
 
 const upsert = db.prepare(`
-  INSERT INTO members (nome, pin_hash, ativo, vencimento, created_at)
-  VALUES (@nome, @pinHash, @ativo, @vencimento, @createdAt)
+  INSERT INTO members (nome, pin_hash, pin_hash_offline, ativo, vencimento, created_at)
+  VALUES (@nome, @pinHash, @pinHashOffline, @ativo, @vencimento, @createdAt)
   ON CONFLICT(pin_hash) DO UPDATE SET
     nome = excluded.nome,
+    pin_hash_offline = excluded.pin_hash_offline,
     ativo = excluded.ativo,
     vencimento = excluded.vencimento
 `);
@@ -30,6 +32,7 @@ db.transaction(() => {
     upsert.run({
       nome: m.nome,
       pinHash: hashPin(m.pin),
+      pinHashOffline: hashPinOffline(m.pin),
       ativo: m.ativo ? 1 : 0,
       vencimento: m.vencimento,
       createdAt: new Date().toISOString(),
