@@ -40,7 +40,7 @@ const PIN_IN_USE = { erro: 'pin_em_uso' };
 const NOT_FOUND = { erro: 'nao_encontrado' };
 
 /** Admin API: every route in this plugin requires `Authorization: Bearer <ADMIN_TOKEN>`. */
-export default async function adminRoutes(app, { config, repo, hashPin }) {
+export default async function adminRoutes(app, { config, repo, hashPin, hashPinOffline }) {
   app.addHook('onRequest', requireSecret(bearerToken, config.adminToken));
 
   app.post('/members', {
@@ -56,7 +56,13 @@ export default async function adminRoutes(app, { config, repo, hashPin }) {
   }, async (request, reply) => {
     const { nome, pin, vencimento, ativo = true } = request.body;
     try {
-      const member = repo.createMember({ nome: nome.trim(), pinHash: hashPin(pin), ativo, vencimento });
+      const member = repo.createMember({
+        nome: nome.trim(),
+        pinHash: hashPin(pin),
+        pinHashOffline: hashPinOffline(pin),
+        ativo,
+        vencimento,
+      });
       return reply.code(201).send(member);
     } catch (err) {
       if (isUniqueViolation(err)) return reply.code(409).send(PIN_IN_USE);
@@ -88,6 +94,7 @@ export default async function adminRoutes(app, { config, repo, hashPin }) {
       const member = repo.updateMember(request.params.id, {
         nome: nome?.trim(),
         pinHash: pin === undefined ? undefined : hashPin(pin),
+        pinHashOffline: pin === undefined ? undefined : hashPinOffline(pin),
         ativo,
         vencimento,
       });

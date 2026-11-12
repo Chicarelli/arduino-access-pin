@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import os from 'node:os';
 import { loadConfig } from './config.js';
-import { openDatabase } from './db.js';
+import { createRepository, openDatabase } from './db.js';
 import { buildApp } from './app.js';
 
 function lanIPv4Addresses() {
@@ -25,6 +25,13 @@ try {
 for (const warning of config.warnings) console.warn(`[config] WARNING: ${warning}`);
 
 const db = openDatabase(config.dbPath);
+const withoutOfflineHash = createRepository(db).countMembersWithoutOfflineHash();
+if (withoutOfflineHash > 0) {
+  console.warn(
+    `[offline] WARNING: ${withoutOfflineHash} member(s) have no offline PIN hash, so they are left out of the ESP32 ` +
+      'offline list. Run "npm run seed" for the sample members, or set their PIN again (PATCH /api/members/:id).',
+  );
+}
 const app = buildApp({ config, db, logger: { level: config.logLevel } });
 
 try {

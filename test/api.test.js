@@ -8,6 +8,8 @@ const config = {
   deviceKey: 'test-device-key',
   adminToken: 'test-admin-token',
   pinPepper: 'test-pepper-0123456789abcdef',
+  // Bytes 00..1f: the reference key documented in the README, so expected hashes can be cross-checked.
+  offlineKey: '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f',
 };
 const DEVICE = { 'x-device-key': config.deviceKey };
 const ADMIN = { authorization: `Bearer ${config.adminToken}` };
@@ -237,5 +239,144 @@ describe('admin API', () => {
     assert.equal(missing.statusCode, 404);
     const badLimit = await app.inject({ method: 'GET', url: '/api/logs?limit=abc', headers: ADMIN });
     assert.equal(badLimit.statusCode, 400);
+  });
+});
+
+describe('GET /api/dispositivo/membros', () => {
+  // Noon in Sao Paulo on 2026-11-11 (day 2506), so the dates below hold wherever the tests run.
+  beforeEach(() => { clock = Date.parse('2026-11-11T15:00:00Z'); });
+
+  function membros(versao, headers = DEVICE) {
+    const url = versao === undefined ? '/api/dispositivo/membros' : `/api/dispositivo/membros?versao=${versao}`;
+    return app.inject({ method: 'GET', url, headers });
+  }
+  async function currentVersion() {
+    const res = await membros(0);
+    assert.equal(res.statusCode, 200);
+    return res.json().versao;
+  }
+  function patch(id, payload) {
+    return app.inject({ method: 'PATCH', url: `/api/members/${id}`, headers: ADMIN, payload });
+  }
+
+  test('401 without a valid device key', async () => {
+    for (const headers of [{}, { 'x-device-key': 'nope' }, ADMIN]) {
+      const res = await membros(0, headers);
+      assert.equal(res.statusCode, 401);
+      assert.deepEqual(res.json(), { erro: 'nao_autorizado' });
+    }
+  });
+
+  test('lists only active, paid members with an offline hash, in the compact shape', async () => {
+    const joao = await createMember({ nome: 'Joao', pin: '1234', vencimento: '2026-12-31' });
+    const ana = await createMember({ nome: 'Ana', pin: '4321', vencimento: '2026-11-11' }); // today: still valid
+    await createMember({ nome: 'Maria', pin: '5678', vencimento: '2026-11-10' }); // overdue
+    await createMember({ nome: 'Pedro', pin: '9999', vencimento: '2026-12-31', ativo: false });
+    const legacy = await createMember({ nome: 'Legado', pin: '2468', vencimento: '2026-12-31' });
+    db.prepare('UPDATE members SET pin_hash_offline = NULL WHERE id = ?').run(legacy.id); // as after the migration
+
+    const res = await membros(0);
+    assert.equal(res.statusCode, 200);
+    assert.match(res.headers['content-type'], /^application\/json/);
+    // Starts at 1; 5 creates + 1 hash cleared = 7.
+    assert.equal(res.body, `{"versao":7,"membros":[[${joao.id},"75a2b0661f593e7c",2556],[${ana.id},"bd3e34fdff668e05",2506]]}`);
+  });
+
+  test('"today" is the Sao Paulo date, not UTC', async () => {
+    const m = await createMember({ nome: 'Ana', pin: '4321', vencimento: '2026-11-11' });
+
+    clock = Date.parse('2026-11-12T02:59:59Z'); // 23:59:59 on 2026-11-11 in Sao Paulo
+    const before = (await membros(0)).json();
+    assert.deepEqual(before.membros.map((e) => e[0]), [m.id]);
+
+    clock = Date.parse('2026-11-12T03:00:00Z'); // midnight in Sao Paulo
+    const after = (await membros(0)).json();
+    assert.deepEqual(after.membros, []);
+    // A date passing is not a change: the device drops the member by checking validade_dias itself.
+    assert.equal(after.versao, before.versao);
+  });
+
+  test('304 with an empty body when the device already has the current version', async () => {
+    await createMember({ nome: 'Joao', pin: '1234', vencimento: '2026-12-31' });
+    const versao = await currentVersion();
+
+    const same = await membros(versao);
+    assert.equal(same.statusCode, 304);
+    assert.equal(same.body, '');
+
+    for (const other of [undefined, 0, versao - 1, versao + 1]) {
+      const res = await membros(other);
+      assert.equal(res.statusCode, 200, `versao=${other}`);
+      assert.equal(res.json().versao, versao);
+    }
+  });
+
+  test('400 when versao is not a non-negative integer', async () => {
+    for (const versao of ['abc', '-1', '1.5']) {
+      const res = await membros(versao);
+      assert.equal(res.statusCode, 400, versao);
+      assert.deepEqual(res.json(), { erro: 'requisicao_invalida' });
+    }
+  });
+
+  test('lista_versao goes up exactly when the offline list can change', async () => {
+    const m = await createMember({ nome: 'Joao', pin: '1234', vencimento: '2026-12-31' });
+    await createMember({ nome: 'Ana', pin: '4321', vencimento: '2026-12-31' });
+    let versao = await currentVersion();
+
+    async function step(label, action, bumps) {
+      await action();
+      const now = await currentVersion();
+      assert.equal(now, bumps ? versao + 1 : versao, label);
+      versao = now;
+    }
+
+    await step('nome only', () => patch(m.id, { nome: 'Joao Silva' }), false);
+    await step('same ativo', () => patch(m.id, { ativo: true }), false);
+    await step('same vencimento', () => patch(m.id, { vencimento: '2026-12-31' }), false);
+    await step('same PIN', () => patch(m.id, { pin: '1234' }), false);
+    await step('PIN taken (409)', () => patch(m.id, { pin: '4321' }), false);
+    await step('unknown member (404)', () => patch(999, { ativo: false }), false);
+    await step('time passes', () => { clock += 60 * 86_400_000; }, false);
+    await step('PIN changed', () => patch(m.id, { pin: '5678' }), true);
+    await step('ativo changed', () => patch(m.id, { ativo: false }), true);
+    await step('vencimento changed', () => patch(m.id, { vencimento: '2027-06-30' }), true);
+    await step('several fields in one PATCH', () => patch(m.id, { ativo: true, vencimento: '2027-07-31' }), true);
+    await step('created', () => createMember({ nome: 'Novo', pin: '1357', vencimento: '2027-01-31' }), true);
+    await step('create with a taken PIN (409)', () => app.inject({
+      method: 'POST', url: '/api/members', headers: ADMIN, payload: { nome: 'X', pin: '1357', vencimento: '2027-01-31' },
+    }), false);
+    await step('deleted', () => app.inject({ method: 'DELETE', url: `/api/members/${m.id}`, headers: ADMIN }), true);
+    await step('delete again (404)', () => app.inject({ method: 'DELETE', url: `/api/members/${m.id}`, headers: ADMIN }), false);
+  });
+
+  test('a PIN change replaces the offline hash', async () => {
+    const m = await createMember({ nome: 'Joao', pin: '1234', vencimento: '2026-12-31' });
+    await patch(m.id, { pin: '5678' });
+    assert.deepEqual((await membros(0)).json().membros, [[m.id, 'b7b278a6c70adb7b', 2556]]);
+  });
+
+  test('handles 2000+ members', async () => {
+    const insert = db.prepare(`INSERT INTO members (nome, pin_hash, pin_hash_offline, ativo, vencimento, created_at)
+      VALUES (?, ?, ?, 1, '2027-11-11', '2026-11-11T00:00:00.000Z')`);
+    db.transaction(() => {
+      for (let i = 1; i <= 2500; i++) insert.run(`Membro ${i}`, `online-${i}`, i.toString(16).padStart(16, '0'));
+    })();
+
+    const res = await membros(0);
+    assert.equal(res.statusCode, 200);
+    const body = res.json();
+    assert.equal(body.versao, 2501);
+    assert.equal(body.membros.length, 2500);
+    assert.deepEqual(body.membros[2499], [2500, '00000000000009c4', 2871]);
+    assert.ok(res.body.length < 2500 * 34, `body is ${res.body.length} bytes`);
+  });
+
+  test('POST /api/acesso is unaffected by the offline list', async () => {
+    // /api/acesso checks the real server date, not the test clock.
+    await createMember({ nome: 'Joao', pin: '1234', vencimento: future });
+    const res = await acesso('1234');
+    assert.deepEqual(Object.keys(res.json()), ['liberado', 'motivo', 'mensagem', 'tempo_abertura_ms']);
+    assert.equal(res.json().motivo, 'OK');
   });
 });
